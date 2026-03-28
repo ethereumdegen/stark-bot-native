@@ -11,6 +11,8 @@ pub enum AppEvent {
     Progress(crate::starflask::ProgressEvent),
     /// Starflask query completed.
     QueryComplete(Result<String, String>),
+    /// Provision completed with remote agent data.
+    ProvisionComplete(Result<Vec<serde_json::Value>, String>),
 }
 
 pub struct EventHandler {

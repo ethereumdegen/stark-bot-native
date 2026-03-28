@@ -22,6 +22,8 @@ pub enum SlashResult {
     Switched(String),
     /// Enter connect flow to set API key.
     Connect,
+    /// Provision agents from API (async).
+    Provision,
     /// Clear the screen.
     Clear,
     /// Quit the app.
@@ -146,6 +148,7 @@ impl App {
                 "/help         Show this help\r\n\
                  /agents       List available agents\r\n\
                  /agent <n>    Switch to agent by name\r\n\
+                 /provision    Sync agents from Starflask API\r\n\
                  /connect      Set API key\r\n\
                  /clear        Clear the screen\r\n\
                  /quit         Exit starkbot"
@@ -161,6 +164,7 @@ impl App {
                     SlashResult::Unknown(format!("Unknown agent: {}", arg))
                 }
             }
+            "/provision" | "/sync" => SlashResult::Provision,
             "/connect" => SlashResult::Connect,
             "/clear" => SlashResult::Clear,
             "/quit" | "/q" | "/exit" => SlashResult::Quit,
@@ -175,23 +179,25 @@ impl App {
         });
     }
 
-    /// Submit the current input as a query.
-    pub fn submit_query(&mut self) {
+    /// Submit the current input as a query. Returns Err with message if can't send.
+    pub fn submit_query(&mut self) -> Result<(), String> {
         let message = self.input.trim().to_string();
-        if message.is_empty() { return; }
+        if message.is_empty() { return Ok(()); }
 
         self.input.clear();
         self.cursor_pos = 0;
         self.push_message("user", &message);
 
         let Some(agent_id) = self.current_agent_id.clone() else {
-            self.push_message("error", "No agent selected. Run `starkbot provision` first.");
-            return;
+            let err = "No agent selected. Run `starkbot provision` first.".to_string();
+            self.push_message("error", &err);
+            return Err(err);
         };
 
-        let Some(ref _client) = self.client else {
-            self.push_message("error", "Not connected. Check STARFLASK_API_KEY.");
-            return;
+        if self.client.is_none() {
+            let err = "Not connected. Check STARFLASK_API_KEY or use /connect.".to_string();
+            self.push_message("error", &err);
+            return Err(err);
         };
 
         self.querying = true;
@@ -238,6 +244,58 @@ impl App {
                 }
             }
         });
+        Ok(())
+    }
+
+    /// Spawn async provision task to sync agents from API.
+    pub fn start_provision(&mut self) -> Result<(), String> {
+        let Some(ref _client) = self.client else {
+            return Err("Not connected. Use /connect to set API key first.".to_string());
+        };
+
+        let tx = self.event_tx.clone().unwrap();
+        let config = self.config.clone();
+
+        tokio::spawn(async move {
+            let client = match StarflaskClient::new(&config) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::ProvisionComplete(Err(e)));
+                    return;
+                }
+            };
+
+            match client.list_agents().await {
+                Ok(agents) => { let _ = tx.send(AppEvent::ProvisionComplete(Ok(agents))); }
+                Err(e) => { let _ = tx.send(AppEvent::ProvisionComplete(Err(e))); }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Process provisioned agents — upsert into DB and reload.
+    pub fn finish_provision(&mut self, remote_agents: &[serde_json::Value]) -> Vec<String> {
+        let mut synced = Vec::new();
+        for agent in remote_agents {
+            let id = agent.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = agent.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = agent.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let capability = agent.get("capability")
+                .or_else(|| agent.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if id.is_empty() || capability.is_empty() {
+                continue;
+            }
+
+            if self.db.upsert_agent(capability, id, name, desc, "active").is_ok() {
+                synced.push(format!("{} ({})", capability, name));
+            }
+        }
+        self.load_agents();
+        synced
     }
 
     pub fn handle_progress(&mut self, event: ProgressEvent) {

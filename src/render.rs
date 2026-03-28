@@ -15,6 +15,11 @@ pub struct InlineRenderer {
     out: io::Stdout,
 }
 
+/// Replace bare `\n` with `\r\n` for raw mode output.
+fn raw_lines(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
 impl InlineRenderer {
     pub fn new() -> Self {
         Self { out: io::stdout() }
@@ -50,16 +55,19 @@ impl InlineRenderer {
     }
 
     pub fn print_agent_message(&mut self, agent: &str, content: &str) {
+        let content = raw_lines(content);
         let _ = write!(self.out, "{}{}>{} {}\r\n", GREEN, agent, RESET, content);
         let _ = self.out.flush();
     }
 
     pub fn print_system_message(&mut self, content: &str) {
+        let content = raw_lines(content);
         let _ = write!(self.out, "{}--- {}{}\r\n", GRAY, content, RESET);
         let _ = self.out.flush();
     }
 
     pub fn print_error(&mut self, content: &str) {
+        let content = raw_lines(content);
         let _ = write!(self.out, "{}ERR {}{}\r\n", RED, content, RESET);
         let _ = self.out.flush();
     }

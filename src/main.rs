@@ -124,6 +124,23 @@ async fn run_tui() -> Result<(), String> {
                     renderer.update_progress(text);
                 }
             }
+            AppEvent::ProvisionComplete(result) => {
+                match result {
+                    Ok(remote_agents) => {
+                        let synced = app.finish_provision(&remote_agents);
+                        if synced.is_empty() {
+                            renderer.print_system_message("No agents found on Starflask.");
+                        } else {
+                            for name in &synced {
+                                renderer.print_system_message(&format!("  {}", name));
+                            }
+                            renderer.print_system_message(&format!("Synced {} agent(s).", synced.len()));
+                        }
+                    }
+                    Err(e) => renderer.print_error(&format!("Provision failed: {}", e)),
+                }
+                renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+            }
             AppEvent::QueryComplete(result) => {
                 renderer.clear_progress();
                 let content = app.handle_query_complete(result);
@@ -210,6 +227,12 @@ fn handle_chat_key(app: &mut App, renderer: &mut InlineRenderer, key: crossterm:
                         renderer.print_agents(&agents, &current);
                     }
                     SlashResult::Switched(msg) => renderer.print_system_message(&msg),
+                    SlashResult::Provision => {
+                        match app.start_provision() {
+                            Ok(()) => renderer.print_system_message("Syncing agents from Starflask..."),
+                            Err(e) => renderer.print_error(&e),
+                        }
+                    }
                     SlashResult::Connect => {
                         app.setup_input.clear();
                         app.setup_cursor = 0;
@@ -230,7 +253,10 @@ fn handle_chat_key(app: &mut App, renderer: &mut InlineRenderer, key: crossterm:
                 renderer.clear_progress();
                 renderer.newline();
                 renderer.print_user_message(&text);
-                app.submit_query();
+                if let Err(e) = app.submit_query() {
+                    renderer.print_error(&e);
+                    renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+                }
                 // Progress will be shown via events
             }
         }
