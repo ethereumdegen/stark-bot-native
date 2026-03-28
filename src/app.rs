@@ -116,8 +116,16 @@ impl App {
     }
 
     fn resolve_current_agent(&mut self) {
+        let target = self.current_agent.to_lowercase();
         self.current_agent_id = self.agents.iter()
-            .find(|a| a.capability == self.current_agent)
+            // Exact match on capability
+            .find(|a| a.capability.to_lowercase() == target)
+            // Fuzzy: capability or name contains the search term
+            .or_else(|| self.agents.iter().find(|a|
+                a.capability.to_lowercase().contains(&target) ||
+                a.name.to_lowercase().contains(&target)
+            ))
+            // Last resort: first agent
             .or_else(|| self.agents.first())
             .map(|a| {
                 self.current_agent = a.capability.clone();
@@ -145,21 +153,36 @@ impl App {
 
         match command {
             "/help" | "/h" => SlashResult::Help(
-                "/help         Show this help\r\n\
-                 /agents       List available agents\r\n\
-                 /agent <n>    Switch to agent by name\r\n\
-                 /provision    Sync agents from Starflask API\r\n\
-                 /connect      Set API key\r\n\
-                 /clear        Clear the screen\r\n\
-                 /quit         Exit starkbot"
+                "/help           Show this help\r\n\
+                 /agents         List available agents\r\n\
+                 /agent <name>   Switch to agent by name\r\n\
+                 /default <name> Set default agent (persisted)\r\n\
+                 /provision      Sync agents from Starflask API\r\n\
+                 /connect        Set API key\r\n\
+                 /clear          Clear the screen\r\n\
+                 /quit           Exit starkbot"
                     .to_string(),
             ),
             "/agents" => SlashResult::Agents,
             "/agent" => {
                 if arg.is_empty() {
-                    SlashResult::Unknown("Usage: /agent <name>".to_string())
+                    SlashResult::Unknown(format!("Current agent: {}", self.current_agent))
                 } else if let Some(msg) = self.select_agent_by_name(arg) {
                     SlashResult::Switched(msg)
+                } else {
+                    SlashResult::Unknown(format!("Unknown agent: {}", arg))
+                }
+            }
+            "/default" => {
+                if arg.is_empty() {
+                    SlashResult::Unknown(format!("Default agent: {} (use /default <name> to change)", self.config.default_agent))
+                } else if let Some(msg) = self.select_agent_by_name(arg) {
+                    self.config.default_agent = self.current_agent.clone();
+                    if let Err(e) = self.config.save() {
+                        SlashResult::Unknown(format!("{}\r\nWarning: failed to save config: {}", msg, e))
+                    } else {
+                        SlashResult::Switched(format!("{}\r\nSaved as default agent.", msg))
+                    }
                 } else {
                     SlashResult::Unknown(format!("Unknown agent: {}", arg))
                 }
