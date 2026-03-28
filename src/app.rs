@@ -5,56 +5,64 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::event::AppEvent;
 use crate::starflask::{self, ProgressEvent, StarflaskClient};
-use crate::theme::Theme;
 
-/// Input mode (vi-like).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Normal,
-    Insert,
-}
-
-/// Which screen is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
+    Setup,
     Chat,
-    Agents,
-    Help,
 }
 
-/// A single chat message.
+/// Result of a slash command.
+pub enum SlashResult {
+    /// Print help text.
+    Help(String),
+    /// Print agent list.
+    Agents,
+    /// Switched agent — message to display.
+    Switched(String),
+    /// Enter connect flow to set API key.
+    Connect,
+    /// Clear the screen.
+    Clear,
+    /// Quit the app.
+    Quit,
+    /// Unknown command.
+    Unknown(String),
+}
+
+/// A single chat message (kept for DB logging).
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
-    pub role: String,     // "user", "agent", "system", "progress"
+    pub role: String,
     pub content: String,
 }
 
 pub struct App {
     pub running: bool,
-    pub mode: Mode,
     pub screen: Screen,
-    pub theme: Theme,
     pub config: Config,
     pub db: Arc<Database>,
     pub client: Option<StarflaskClient>,
+
+    // Setup state
+    pub setup_input: String,
+    pub setup_cursor: usize,
 
     // Chat state
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub cursor_pos: usize,
-    pub scroll_offset: usize,
-    pub auto_scroll: bool,
 
     // Agent state
     pub current_agent: String,
     pub current_agent_id: Option<String>,
     pub agents: Vec<crate::db::Agent>,
-    pub agent_selection: usize,
 
     // Query state
     pub querying: bool,
+    pub progress_text: Option<String>,
 
-    // Event channel for async tasks to send back
+    // Event channel for async tasks
     pub event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
 }
 
@@ -65,28 +73,24 @@ impl App {
 
         Self {
             running: true,
-            mode: Mode::Normal,
-            screen: Screen::Chat,
-            theme: Theme::default(),
+            screen: if config.api_key().is_some() { Screen::Chat } else { Screen::Setup },
             config,
             db: Arc::new(db),
             client,
 
-            messages: vec![ChatMessage {
-                role: "system".into(),
-                content: "Welcome to starkbot. Press 'i' to type, '?' for help.".into(),
-            }],
+            setup_input: String::new(),
+            setup_cursor: 0,
+
+            messages: Vec::new(),
             input: String::new(),
             cursor_pos: 0,
-            scroll_offset: 0,
-            auto_scroll: true,
 
-            current_agent: current_agent,
+            current_agent,
             current_agent_id: None,
             agents: Vec::new(),
-            agent_selection: 0,
 
             querying: false,
+            progress_text: None,
             event_tx: None,
         }
     }
@@ -95,7 +99,13 @@ impl App {
         self.event_tx = Some(tx);
     }
 
-    /// Load agents from DB and resolve current agent ID.
+    /// Called after setup saves an API key.
+    pub fn finish_setup(&mut self) {
+        self.client = StarflaskClient::new(&self.config).ok();
+        self.load_agents();
+        self.screen = Screen::Chat;
+    }
+
     pub fn load_agents(&mut self) {
         if let Ok(agents) = self.db.list_agents() {
             self.agents = agents;
@@ -113,14 +123,48 @@ impl App {
             });
     }
 
-    pub fn select_agent(&mut self, idx: usize) {
-        if idx < self.agents.len() {
-            self.agent_selection = idx;
-            let agent = &self.agents[idx];
+    pub fn select_agent_by_name(&mut self, name: &str) -> Option<String> {
+        let name_lower = name.to_lowercase();
+        if let Some(agent) = self.agents.iter().find(|a| a.capability.to_lowercase() == name_lower || a.name.to_lowercase() == name_lower) {
             self.current_agent = agent.capability.clone();
             self.current_agent_id = Some(agent.agent_id.clone());
-            self.push_system(&format!("Switched to agent: {}", agent.name));
-            self.screen = Screen::Chat;
+            let msg = format!("Switched to agent: {}", agent.name);
+            self.push_message("system", &msg);
+            Some(msg)
+        } else {
+            None
+        }
+    }
+
+    pub fn handle_slash_command(&mut self, cmd: &str) -> SlashResult {
+        let parts: Vec<&str> = cmd.trim().splitn(2, ' ').collect();
+        let command = parts[0];
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+        match command {
+            "/help" | "/h" => SlashResult::Help(
+                "/help         Show this help\r\n\
+                 /agents       List available agents\r\n\
+                 /agent <n>    Switch to agent by name\r\n\
+                 /connect      Set API key\r\n\
+                 /clear        Clear the screen\r\n\
+                 /quit         Exit starkbot"
+                    .to_string(),
+            ),
+            "/agents" => SlashResult::Agents,
+            "/agent" => {
+                if arg.is_empty() {
+                    SlashResult::Unknown("Usage: /agent <name>".to_string())
+                } else if let Some(msg) = self.select_agent_by_name(arg) {
+                    SlashResult::Switched(msg)
+                } else {
+                    SlashResult::Unknown(format!("Unknown agent: {}", arg))
+                }
+            }
+            "/connect" => SlashResult::Connect,
+            "/clear" => SlashResult::Clear,
+            "/quit" | "/q" | "/exit" => SlashResult::Quit,
+            _ => SlashResult::Unknown(format!("Unknown command: {}", command)),
         }
     }
 
@@ -129,17 +173,6 @@ impl App {
             role: role.into(),
             content: content.into(),
         });
-        if self.auto_scroll {
-            self.scroll_to_bottom();
-        }
-    }
-
-    pub fn push_system(&mut self, content: &str) {
-        self.push_message("system", content);
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = self.messages.len().saturating_sub(1);
     }
 
     /// Submit the current input as a query.
@@ -162,7 +195,7 @@ impl App {
         };
 
         self.querying = true;
-        self.push_message("progress", "Sending query...");
+        self.progress_text = Some("Sending query...".to_string());
 
         // Log to DB
         let capability = self.current_agent.clone();
@@ -210,58 +243,32 @@ impl App {
     pub fn handle_progress(&mut self, event: ProgressEvent) {
         match event {
             ProgressEvent::StatusChange(status) => {
-                // Update the last progress message
-                if let Some(msg) = self.messages.last_mut() {
-                    if msg.role == "progress" {
-                        msg.content = format!("Status: {}", status);
-                        return;
-                    }
-                }
-                self.push_message("progress", &format!("Status: {}", status));
+                self.progress_text = Some(format!("Status: {}", status));
             }
             ProgressEvent::LogEntry { summary, .. } => {
-                // Update the last progress message
-                if let Some(msg) = self.messages.last_mut() {
-                    if msg.role == "progress" {
-                        msg.content = summary;
-                        return;
-                    }
-                }
-                self.push_message("progress", &summary);
+                self.progress_text = Some(summary);
             }
             ProgressEvent::Error(e) => {
-                self.push_message("system", &format!("Warning: {}", e));
+                self.progress_text = Some(format!("Warning: {}", e));
             }
-        }
-        if self.auto_scroll {
-            self.scroll_to_bottom();
         }
     }
 
-    pub fn handle_query_complete(&mut self, result: Result<String, String>) {
+    pub fn handle_query_complete(&mut self, result: Result<String, String>) -> String {
         self.querying = false;
-        // Remove last progress message
-        if let Some(msg) = self.messages.last() {
-            if msg.role == "progress" {
-                self.messages.pop();
-            }
-        }
+        self.progress_text = None;
 
         match result {
             Ok(text) => {
-                if text.is_empty() {
-                    self.push_message("agent", "(empty response)");
-                } else {
-                    self.push_message("agent", &text);
-                }
-                let _ = self.db.log_message(
-                    &self.current_agent, None,
-                    self.messages.last().map(|m| m.content.as_str()).unwrap_or(""),
-                    "agent",
-                );
+                let content = if text.is_empty() { "(empty response)".to_string() } else { text };
+                self.push_message("agent", &content);
+                let _ = self.db.log_message(&self.current_agent, None, &content, "agent");
+                content
             }
             Err(e) => {
-                self.push_message("error", &format!("Error: {}", e));
+                let content = format!("Error: {}", e);
+                self.push_message("error", &content);
+                content
             }
         }
     }

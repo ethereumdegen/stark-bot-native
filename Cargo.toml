@@ -12,7 +12,6 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 dirs = "6"
 dotenvy = "0.15"
-ratatui = "0.29"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

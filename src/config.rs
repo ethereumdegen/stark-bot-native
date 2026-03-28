@@ -66,6 +66,32 @@ impl Config {
         std::env::var("STARFLASK_API_KEY").ok().filter(|k| !k.is_empty())
     }
 
+    pub fn save_api_key(key: &str) -> Result<(), String> {
+        let dir = config_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let env_path = dir.join(".env");
+
+        // Read existing content, replace or append the key
+        let mut lines: Vec<String> = if env_path.exists() {
+            std::fs::read_to_string(&env_path)
+                .map_err(|e| e.to_string())?
+                .lines()
+                .filter(|l| !l.starts_with("STARFLASK_API_KEY="))
+                .map(|l| l.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        lines.push(format!("STARFLASK_API_KEY={}", key));
+
+        std::fs::write(&env_path, lines.join("\n") + "\n").map_err(|e| e.to_string())?;
+
+        // Set in current process so it takes effect immediately
+        // SAFETY: We're single-threaded at this point in the setup flow
+        unsafe { std::env::set_var("STARFLASK_API_KEY", key); }
+        Ok(())
+    }
+
     pub fn base_url(&self) -> String {
         std::env::var("STARFLASK_BASE_URL")
             .ok()

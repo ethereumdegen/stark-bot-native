@@ -4,25 +4,20 @@ mod commands;
 mod config;
 mod db;
 mod event;
+mod render;
 mod starflask;
 mod theme;
-mod ui;
 
-use std::io;
 use std::time::Duration;
 
 use clap::Parser;
 use crossterm::event::{KeyCode, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use crossterm::ExecutableCommand;
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
-use app::{App, Mode, Screen};
+use app::{App, Screen, SlashResult};
 use cli::{Cli, Commands};
 use event::{AppEvent, EventHandler};
+use render::InlineRenderer;
 
 #[tokio::main]
 async fn main() {
@@ -39,7 +34,7 @@ async fn main() {
         }
         Some(Commands::Provision { file }) => {
             let cfg = config::Config::load();
-            let _ = cfg; // ensure .env is loaded
+            let _ = cfg;
             if let Err(e) = commands::provision::run(file).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -62,10 +57,9 @@ async fn main() {
             }
             return;
         }
-        None => {} // Launch TUI
+        None => {}
     }
 
-    // ── TUI mode ──
     if let Err(e) = run_tui().await {
         eprintln!("Error: {}", e);
         std::process::exit(1);
@@ -76,126 +70,198 @@ async fn run_tui() -> Result<(), String> {
     let cfg = config::Config::load();
     let db = db::Database::open(&config::db_path())?;
     let mut app = App::new(cfg, db);
-
-    // Load agents from DB
     app.load_agents();
 
-    // Check connection
-    if app.client.is_none() {
-        app.push_system("Warning: STARFLASK_API_KEY not set. Set it in ~/.config/starkbot/.env");
-    }
-    if app.agents.is_empty() {
-        app.push_system("No agents loaded. Run `starkbot provision` to sync agents.");
+    let mut renderer = InlineRenderer::new();
+
+    // Panic hook: restore terminal
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        default_hook(info);
+    }));
+
+    // Print splash
+    renderer.print_splash(&app.current_agent, app.client.is_some());
+
+    // Setup flow if needed
+    if app.screen == Screen::Setup {
+        renderer.print_setup_prompt();
     }
 
-    // Setup terminal
+    // Enter raw mode
     enable_raw_mode().map_err(|e| e.to_string())?;
-    io::stdout().execute(EnterAlternateScreen).map_err(|e| e.to_string())?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
 
     // Event handler
-    let mut events = EventHandler::new(Duration::from_millis(250));
+    let mut events = EventHandler::new(Duration::from_millis(150));
     app.set_event_tx(events.tx());
 
-    // Main loop
-    while app.running {
-        terminal.draw(|frame| ui::render(frame, &app)).map_err(|e| e.to_string())?;
+    // Draw initial prompt if in chat mode
+    if app.screen == Screen::Chat {
+        renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+    }
 
-        if let Some(event) = events.next().await {
-            match event {
-                AppEvent::Key(key) => handle_key(&mut app, key),
-                AppEvent::Tick => {} // just redraw
-                AppEvent::Progress(evt) => app.handle_progress(evt),
-                AppEvent::QueryComplete(result) => app.handle_query_complete(result),
+    while app.running {
+        let Some(event) = events.next().await else { break };
+
+        match event {
+            AppEvent::Key(key) => {
+                // Ctrl+C always quits
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    app.running = false;
+                    break;
+                }
+
+                match app.screen {
+                    Screen::Setup => handle_setup_key(&mut app, &mut renderer, key),
+                    Screen::Chat => handle_chat_key(&mut app, &mut renderer, key),
+                }
+            }
+            AppEvent::Tick => {}
+            AppEvent::Progress(evt) => {
+                app.handle_progress(evt);
+                if let Some(ref text) = app.progress_text {
+                    renderer.update_progress(text);
+                }
+            }
+            AppEvent::QueryComplete(result) => {
+                renderer.clear_progress();
+                let content = app.handle_query_complete(result);
+                let agent = app.current_agent.clone();
+                if content.starts_with("Error:") {
+                    renderer.print_error(&content);
+                } else {
+                    renderer.print_agent_message(&agent, &content);
+                }
+                renderer.redraw_input("you> ", &app.input, app.cursor_pos);
             }
         }
     }
 
     // Restore terminal
     disable_raw_mode().map_err(|e| e.to_string())?;
-    io::stdout().execute(LeaveAlternateScreen).map_err(|e| e.to_string())?;
+    renderer.newline();
     Ok(())
 }
 
-fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
-    // Ctrl+C always quits
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        app.running = false;
-        return;
-    }
-
-    match app.mode {
-        Mode::Normal => handle_normal_key(app, key),
-        Mode::Insert => handle_insert_key(app, key),
-    }
-}
-
-fn handle_normal_key(app: &mut App, key: crossterm::event::KeyEvent) {
-    match app.screen {
-        Screen::Chat => match key.code {
-            KeyCode::Char('q') => app.running = false,
-            KeyCode::Char('i') => app.mode = Mode::Insert,
-            KeyCode::Char('?') => app.screen = Screen::Help,
-            KeyCode::Tab => app.screen = Screen::Agents,
-            KeyCode::Char('j') | KeyCode::Down => {
-                app.auto_scroll = false;
-                app.scroll_offset = app.scroll_offset.saturating_add(1)
-                    .min(app.messages.len().saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                app.auto_scroll = false;
-                app.scroll_offset = app.scroll_offset.saturating_sub(1);
-            }
-            KeyCode::Char('g') => {
-                app.auto_scroll = false;
-                app.scroll_offset = 0;
-            }
-            KeyCode::Char('G') => {
-                app.auto_scroll = true;
-                app.scroll_to_bottom();
-            }
-            _ => {}
-        },
-        Screen::Agents => match key.code {
-            KeyCode::Esc | KeyCode::Tab => app.screen = Screen::Chat,
-            KeyCode::Char('q') => app.running = false,
-            KeyCode::Char('j') | KeyCode::Down => {
-                if app.agent_selection < app.agents.len().saturating_sub(1) {
-                    app.agent_selection += 1;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                app.agent_selection = app.agent_selection.saturating_sub(1);
-            }
-            KeyCode::Enter => {
-                let idx = app.agent_selection;
-                app.select_agent(idx);
-            }
-            _ => {}
-        },
-        Screen::Help => match key.code {
-            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => app.screen = Screen::Chat,
-            _ => {}
-        },
-    }
-}
-
-fn handle_insert_key(app: &mut App, key: crossterm::event::KeyEvent) {
+fn handle_setup_key(app: &mut App, renderer: &mut InlineRenderer, key: crossterm::event::KeyEvent) {
     match key.code {
-        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Esc => {
+            renderer.newline();
+            renderer.print_system_message("Skipping setup — running in disconnected mode");
+            app.screen = Screen::Chat;
+            renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+        }
         KeyCode::Enter => {
-            if !app.querying {
-                app.submit_query();
+            let api_key = app.setup_input.trim().to_string();
+            if !api_key.is_empty() {
+                renderer.newline();
+                if let Err(e) = config::Config::save_api_key(&api_key) {
+                    renderer.print_error(&format!("Failed to save key: {}", e));
+                }
+                app.finish_setup();
+                renderer.print_system_message("API key saved");
+                renderer.redraw_input("you> ", &app.input, app.cursor_pos);
             }
         }
-        KeyCode::Backspace => app.input_backspace(),
-        KeyCode::Delete => app.input_delete(),
-        KeyCode::Left => app.input_left(),
-        KeyCode::Right => app.input_right(),
-        KeyCode::Home => app.input_home(),
-        KeyCode::End => app.input_end(),
-        KeyCode::Char(c) => app.input_char(c),
+        KeyCode::Backspace => {
+            if app.setup_cursor > 0 {
+                let prev = app.setup_input[..app.setup_cursor]
+                    .chars().last().map(|c| c.len_utf8()).unwrap_or(0);
+                app.setup_cursor -= prev;
+                app.setup_input.remove(app.setup_cursor);
+                // Redraw masked input
+                let masked: String = "*".repeat(app.setup_input.len());
+                renderer.redraw_input("> ", &masked, app.setup_cursor);
+            }
+        }
+        KeyCode::Char(c) => {
+            app.setup_input.insert(app.setup_cursor, c);
+            app.setup_cursor += c.len_utf8();
+            let masked: String = "*".repeat(app.setup_input.len());
+            renderer.redraw_input("> ", &masked, app.setup_cursor);
+        }
+        _ => {}
+    }
+}
+
+fn handle_chat_key(app: &mut App, renderer: &mut InlineRenderer, key: crossterm::event::KeyEvent) {
+    match key.code {
+        KeyCode::Enter => {
+            if app.querying { return; }
+            let text = app.input.trim().to_string();
+            if text.is_empty() { return; }
+
+            if text.starts_with('/') {
+                // Clear input line first
+                let input_copy = app.input.clone();
+                app.input.clear();
+                app.cursor_pos = 0;
+
+                // Temporarily leave the prompt line
+                renderer.newline();
+
+                let result = app.handle_slash_command(&input_copy);
+                match result {
+                    SlashResult::Help(text) => renderer.print_help(&text),
+                    SlashResult::Agents => {
+                        let agents = app.agents.clone();
+                        let current = app.current_agent.clone();
+                        renderer.print_agents(&agents, &current);
+                    }
+                    SlashResult::Switched(msg) => renderer.print_system_message(&msg),
+                    SlashResult::Connect => {
+                        app.setup_input.clear();
+                        app.setup_cursor = 0;
+                        app.screen = Screen::Setup;
+                        renderer.print_setup_prompt();
+                        return;
+                    }
+                    SlashResult::Clear => renderer.clear_screen(),
+                    SlashResult::Quit => {
+                        app.running = false;
+                        return;
+                    }
+                    SlashResult::Unknown(msg) => renderer.print_error(&msg),
+                }
+                renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+            } else {
+                // Normal message: print it, then submit
+                renderer.clear_progress();
+                renderer.newline();
+                renderer.print_user_message(&text);
+                app.submit_query();
+                // Progress will be shown via events
+            }
+        }
+        KeyCode::Backspace => {
+            app.input_backspace();
+            renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+        }
+        KeyCode::Delete => {
+            app.input_delete();
+            renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+        }
+        KeyCode::Left => {
+            app.input_left();
+            renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+        }
+        KeyCode::Right => {
+            app.input_right();
+            renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+        }
+        KeyCode::Home => {
+            app.input_home();
+            renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+        }
+        KeyCode::End => {
+            app.input_end();
+            renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+        }
+        KeyCode::Char(c) => {
+            app.input_char(c);
+            renderer.redraw_input("you> ", &app.input, app.cursor_pos);
+        }
         _ => {}
     }
 }
