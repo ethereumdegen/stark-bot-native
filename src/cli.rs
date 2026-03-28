@@ -24,6 +24,8 @@ pub enum Commands {
         /// Message to send
         message: String,
     },
+    /// Guided first-time setup wizard
+    Setup,
     /// Show or set config values
     Config {
         /// Config key to get/set

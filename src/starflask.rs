@@ -53,6 +53,16 @@ impl StarflaskClient {
         })
     }
 
+    /// List projects from the Starflask API.
+    pub async fn list_projects(&self) -> Result<Vec<Value>, String> {
+        let resp = self.get("/projects").await?;
+        resp.get("projects")
+            .and_then(|v| v.as_array())
+            .or_else(|| resp.as_array())
+            .cloned()
+            .ok_or_else(|| "Unexpected projects response format".into())
+    }
+
     /// List agents from the Starflask API.
     pub async fn list_agents(&self) -> Result<Vec<Value>, String> {
         let resp = self.get("/agents").await?;
@@ -62,11 +72,110 @@ impl StarflaskClient {
             .ok_or_else(|| "Unexpected agents response format".into())
     }
 
-    /// Create a query session. Returns session ID.
+    /// Create a query session for a specific agent. Returns session ID.
     pub async fn create_session(&self, agent_id: &str, message: &str) -> Result<Uuid, String> {
         let body = serde_json::json!({ "message": message });
         let resp = self.post(&format!("/agents/{}/query", agent_id), body).await?;
         extract_session_id(&resp)
+    }
+
+    /// Send a message to a project's chat channel. Returns (session_id, agent_id).
+    pub async fn project_query(&self, project_id: &str, message: &str) -> Result<(Uuid, String), String> {
+        let body = serde_json::json!({ "message": message });
+        let resp = self.post(&format!("/projects/{}/query", project_id), body).await?;
+
+        let fired = resp.get("fired")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .ok_or_else(|| "No agent fired for project query".to_string())?;
+
+        let session_id = extract_session_id(fired)?;
+        let agent_id = fired.get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok((session_id, agent_id))
+    }
+
+    /// Poll a session by ID using the global /sessions/{id} endpoint.
+    pub async fn poll_session_by_id<F>(
+        &self,
+        session_id: &Uuid,
+        mut progress_fn: F,
+    ) -> Result<SessionResult, String>
+    where
+        F: FnMut(ProgressEvent),
+    {
+        let path = format!("/sessions/{}", session_id);
+        let deadline = tokio::time::Instant::now() + self.poll_timeout;
+        let mut last_status = String::new();
+
+        loop {
+            tokio::time::sleep(self.poll_interval).await;
+
+            if tokio::time::Instant::now() > deadline {
+                return Err(format!("Session timed out after {}s", self.poll_timeout.as_secs()));
+            }
+
+            let detail = match self.get(&path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    progress_fn(ProgressEvent::Error(format!("Poll error (retrying): {}", e)));
+                    continue;
+                }
+            };
+
+            // The /sessions/{id} endpoint wraps in { session: { ... }, session_logs: [...] }
+            let session = detail.get("session").unwrap_or(&detail);
+            let status = session.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+            if status != last_status {
+                progress_fn(ProgressEvent::StatusChange(status.to_string()));
+                last_status = status.to_string();
+            }
+
+            // Emit log entries if present
+            if let Some(logs) = detail.get("session_logs").and_then(|v| v.as_array()) {
+                for entry in logs {
+                    let event_type = entry.get("event")
+                        .or_else(|| entry.get("type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    if event_type == "heartbeat" || event_type == "delegation_waiting" {
+                        continue;
+                    }
+
+                    let iteration = entry.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let summary = summarize_log_entry(event_type, entry);
+
+                    progress_fn(ProgressEvent::LogEntry {
+                        event_type: event_type.to_string(),
+                        iteration,
+                        summary,
+                    });
+                }
+            }
+
+            match status {
+                "completed" => {
+                    return Ok(SessionResult {
+                        result: session.get("result").cloned(),
+                        result_summary: session.get("result_summary")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                    });
+                }
+                "failed" => {
+                    let err = session.get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    return Err(format!("Session failed: {}", err));
+                }
+                _ => continue,
+            }
+        }
     }
 
     /// Poll a session until completion, calling progress_fn with updates.

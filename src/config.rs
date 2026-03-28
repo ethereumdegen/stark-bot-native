@@ -5,6 +5,8 @@ use std::path::PathBuf;
 pub struct Config {
     #[serde(default = "default_agent")]
     pub default_agent: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
     #[serde(default = "default_base_url")]
     pub base_url: String,
     #[serde(default = "default_poll_interval")]
@@ -22,6 +24,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             default_agent: default_agent(),
+            project_id: None,
             base_url: default_base_url(),
             poll_interval_secs: default_poll_interval(),
             poll_timeout_secs: default_poll_timeout(),

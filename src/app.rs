@@ -203,6 +203,8 @@ impl App {
     }
 
     /// Submit the current input as a query. Returns Err with message if can't send.
+    /// Uses project query (chat channel) when project_id is configured,
+    /// falls back to direct agent query otherwise.
     pub fn submit_query(&mut self) -> Result<(), String> {
         let message = self.input.trim().to_string();
         if message.is_empty() { return Ok(()); }
@@ -210,12 +212,6 @@ impl App {
         self.input.clear();
         self.cursor_pos = 0;
         self.push_message("user", &message);
-
-        let Some(agent_id) = self.current_agent_id.clone() else {
-            let err = "No agent selected. Run `starkbot provision` first.".to_string();
-            self.push_message("error", &err);
-            return Err(err);
-        };
 
         if self.client.is_none() {
             let err = "Not connected. Check STARFLASK_API_KEY or use /connect.".to_string();
@@ -230,13 +226,14 @@ impl App {
         let capability = self.current_agent.clone();
         let _ = self.db.log_message(&capability, None, &message, "user");
 
-        // Spawn async polling task
         let tx = self.event_tx.clone().unwrap();
-        let client = StarflaskClient::new(&self.config);
+        let config = self.config.clone();
+        let project_id = self.config.project_id.clone();
+        let agent_id = self.current_agent_id.clone();
         let msg = message.clone();
 
         tokio::spawn(async move {
-            let client = match client {
+            let client = match StarflaskClient::new(&config) {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(AppEvent::QueryComplete(Err(e)));
@@ -244,26 +241,60 @@ impl App {
                 }
             };
 
-            let session_id = match client.create_session(&agent_id, &msg).await {
-                Ok(id) => id,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::QueryComplete(Err(e)));
+            if let Some(pid) = project_id {
+                // Project chat channel flow
+                let (session_id, _agent_id) = match client.project_query(&pid, &msg).await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::QueryComplete(Err(e)));
+                        return;
+                    }
+                };
+
+                let tx_progress = tx.clone();
+                let result = client.poll_session_by_id(&session_id, move |evt| {
+                    let _ = tx_progress.send(AppEvent::Progress(evt));
+                }).await;
+
+                match result {
+                    Ok(session) => {
+                        let text = starflask::parse_text_result(&session.result);
+                        let _ = tx.send(AppEvent::QueryComplete(Ok(text)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::QueryComplete(Err(e)));
+                    }
+                }
+            } else {
+                // Direct agent query fallback
+                let Some(agent_id) = agent_id else {
+                    let _ = tx.send(AppEvent::QueryComplete(Err(
+                        "No project or agent configured. Run `starkbot setup`.".into()
+                    )));
                     return;
-                }
-            };
+                };
 
-            let tx_progress = tx.clone();
-            let result = client.poll_session(&agent_id, &session_id, move |evt| {
-                let _ = tx_progress.send(AppEvent::Progress(evt));
-            }).await;
+                let session_id = match client.create_session(&agent_id, &msg).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::QueryComplete(Err(e)));
+                        return;
+                    }
+                };
 
-            match result {
-                Ok(session) => {
-                    let text = starflask::parse_text_result(&session.result);
-                    let _ = tx.send(AppEvent::QueryComplete(Ok(text)));
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::QueryComplete(Err(e)));
+                let tx_progress = tx.clone();
+                let result = client.poll_session(&agent_id, &session_id, move |evt| {
+                    let _ = tx_progress.send(AppEvent::Progress(evt));
+                }).await;
+
+                match result {
+                    Ok(session) => {
+                        let text = starflask::parse_text_result(&session.result);
+                        let _ = tx.send(AppEvent::QueryComplete(Ok(text)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::QueryComplete(Err(e)));
+                    }
                 }
             }
         });

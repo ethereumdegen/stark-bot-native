@@ -30,13 +30,17 @@ impl InlineRenderer {
         let _ = self.out.flush();
     }
 
-    pub fn print_splash(&mut self, agent: &str, connected: bool) {
+    pub fn print_splash(&mut self, agent: &str, connected: bool, project_id: Option<&str>) {
         let status = if connected { "connected" } else { "disconnected" };
         for line in SPLASH.lines() {
             let _ = write!(self.out, "{}{}{}\r\n", CYAN, line, RESET);
         }
         let _ = write!(self.out, " {}Starflask AI Agent Terminal{} v{}\r\n", BOLD, RESET, env!("CARGO_PKG_VERSION"));
-        let _ = write!(self.out, " Agent: {}{}{} | Status: {}\r\n", YELLOW, agent, RESET, status);
+        if let Some(pid) = project_id {
+            let _ = write!(self.out, " Project: {}{}{} | Status: {}\r\n", YELLOW, pid, RESET, status);
+        } else {
+            let _ = write!(self.out, " Agent: {}{}{} | Status: {}\r\n", YELLOW, agent, RESET, status);
+        }
         let _ = write!(self.out, " Type {}/help{} for commands\r\n", GRAY, RESET);
         self.write_line("");
         let _ = self.out.flush();

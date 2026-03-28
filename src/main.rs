@@ -50,6 +50,13 @@ async fn main() {
             }
             return;
         }
+        Some(Commands::Setup) => {
+            if let Err(e) = commands::setup::run().await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
         Some(Commands::Config { key, value }) => {
             if let Err(e) = commands::config_cmd::run(key, value) {
                 eprintln!("Error: {}", e);
@@ -82,7 +89,7 @@ async fn run_tui() -> Result<(), String> {
     }));
 
     // Print splash
-    renderer.print_splash(&app.current_agent, app.client.is_some());
+    renderer.print_splash(&app.current_agent, app.client.is_some(), app.config.project_id.as_deref());
 
     // Setup flow if needed
     if app.screen == Screen::Setup {
