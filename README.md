@@ -2,6 +2,8 @@
 
 A terminal UI client for [Starflask](https://starflask.com) — the AI agent orchestration platform. Chat with your agents, manage tasks, track sessions, and monitor credits, all from your terminal.
 
+StarkBot is a preset bundle of agents who get deployed to Starflask to complete tasks.  
+
 Built with Rust, async I/O, and the [iocraft](https://github.com/ccbrown/iocraft) component framework.
 
 ```
