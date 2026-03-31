@@ -1,38 +1,36 @@
-use std::sync::Arc;
-use tokio::sync::mpsc;
-
 use crate::config::Config;
-use crate::db::Database;
-use crate::event::AppEvent;
-use crate::starflask::{self, ProgressEvent, StarflaskClient};
+use crate::db;
+use crate::starflask::StarflaskClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Setup,
+    SetupProject,
     Chat,
 }
 
 /// Result of a slash command.
 pub enum SlashResult {
-    /// Print help text.
     Help(String),
-    /// Print agent list.
     Agents,
-    /// Switched agent — message to display.
     Switched(String),
-    /// Enter connect flow to set API key.
     Connect,
-    /// Provision agents from API (async).
     Provision,
-    /// Clear the screen.
     Clear,
-    /// Quit the app.
+    Reset,
     Quit,
-    /// Unknown command.
     Unknown(String),
+    /// Async commands that need API calls.
+    Tasks { status_filter: Option<String> },
+    TaskCreate { title: String, description: String, priority: String },
+    TaskUpdate { task_id: String, status: String },
+    Schedules,
+    Credits,
+    History { limit: u32 },
+    Memories { limit: u32 },
 }
 
-/// A single chat message (kept for DB logging).
+/// A single chat message.
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: String,
@@ -40,92 +38,45 @@ pub struct ChatMessage {
 }
 
 pub struct App {
-    pub running: bool,
-    pub screen: Screen,
     pub config: Config,
-    pub db: Arc<Database>,
     pub client: Option<StarflaskClient>,
 
-    // Setup state
-    pub setup_input: String,
-    pub setup_cursor: usize,
-
-    // Chat state
-    pub messages: Vec<ChatMessage>,
-    pub input: String,
-    pub cursor_pos: usize,
+    // Setup wizard state
+    pub setup_projects: Option<Vec<(String, String)>>,
 
     // Agent state
     pub current_agent: String,
     pub current_agent_id: Option<String>,
-    pub agents: Vec<crate::db::Agent>,
-
-    // Query state
-    pub querying: bool,
-    pub progress_text: Option<String>,
-
-    // Event channel for async tasks
-    pub event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
+    pub agents: Vec<db::Agent>,
 }
 
 impl App {
-    pub fn new(config: Config, db: Database) -> Self {
+    pub fn new(config: Config) -> Self {
         let client = StarflaskClient::new(&config).ok();
         let current_agent = config.default_agent.clone();
 
         Self {
-            running: true,
-            screen: if config.api_key().is_some() { Screen::Chat } else { Screen::Setup },
             config,
-            db: Arc::new(db),
             client,
-
-            setup_input: String::new(),
-            setup_cursor: 0,
-
-            messages: Vec::new(),
-            input: String::new(),
-            cursor_pos: 0,
-
+            setup_projects: None,
             current_agent,
             current_agent_id: None,
             agents: Vec::new(),
-
-            querying: false,
-            progress_text: None,
-            event_tx: None,
         }
     }
 
-    pub fn set_event_tx(&mut self, tx: mpsc::UnboundedSender<AppEvent>) {
-        self.event_tx = Some(tx);
-    }
-
-    /// Called after setup saves an API key.
     pub fn finish_setup(&mut self) {
         self.client = StarflaskClient::new(&self.config).ok();
-        self.load_agents();
-        self.screen = Screen::Chat;
-    }
-
-    pub fn load_agents(&mut self) {
-        if let Ok(agents) = self.db.list_agents() {
-            self.agents = agents;
-        }
-        self.resolve_current_agent();
     }
 
     fn resolve_current_agent(&mut self) {
         let target = self.current_agent.to_lowercase();
         self.current_agent_id = self.agents.iter()
-            // Exact match on capability
             .find(|a| a.capability.to_lowercase() == target)
-            // Fuzzy: capability or name contains the search term
             .or_else(|| self.agents.iter().find(|a|
                 a.capability.to_lowercase().contains(&target) ||
                 a.name.to_lowercase().contains(&target)
             ))
-            // Last resort: first agent
             .or_else(|| self.agents.first())
             .map(|a| {
                 self.current_agent = a.capability.clone();
@@ -139,7 +90,6 @@ impl App {
             self.current_agent = agent.capability.clone();
             self.current_agent_id = Some(agent.agent_id.clone());
             let msg = format!("Switched to agent: {}", agent.name);
-            self.push_message("system", &msg);
             Some(msg)
         } else {
             None
@@ -153,14 +103,22 @@ impl App {
 
         match command {
             "/help" | "/h" => SlashResult::Help(
-                "/help           Show this help\r\n\
-                 /agents         List available agents\r\n\
-                 /agent <name>   Switch to agent by name\r\n\
-                 /default <name> Set default agent (persisted)\r\n\
-                 /provision      Sync agents from Starflask API\r\n\
-                 /connect        Set API key\r\n\
-                 /clear          Clear the screen\r\n\
-                 /quit           Exit starkbot"
+                "/help             Show this help\n\
+                 /agents           List available agents\n\
+                 /agent <name>     Switch to agent by name\n\
+                 /default <name>   Set default agent (persisted)\n\
+                 /tasks [status]   List project tasks (todo/in_progress/done/blocked)\n\
+                 /task <title>     Create a new task\n\
+                 /done <task_id>   Mark a task as done\n\
+                 /schedules        List agent schedules\n\
+                 /credits          Show credit balance\n\
+                 /history [n]      Show recent sessions (default: 10)\n\
+                 /memories [n]     Show agent memories (default: 20)\n\
+                 /provision        Sync agents from Starflask API\n\
+                 /connect          Set API key\n\
+                 /reset            Wipe API key, config & start fresh\n\
+                 /clear            Clear the screen\n\
+                 /quit             Exit stark-bot"
                     .to_string(),
             ),
             "/agents" => SlashResult::Agents,
@@ -179,264 +137,62 @@ impl App {
                 } else if let Some(msg) = self.select_agent_by_name(arg) {
                     self.config.default_agent = self.current_agent.clone();
                     if let Err(e) = self.config.save() {
-                        SlashResult::Unknown(format!("{}\r\nWarning: failed to save config: {}", msg, e))
+                        SlashResult::Unknown(format!("{}\nWarning: failed to save config: {}", msg, e))
                     } else {
-                        SlashResult::Switched(format!("{}\r\nSaved as default agent.", msg))
+                        SlashResult::Switched(format!("{}\nSaved as default agent.", msg))
                     }
                 } else {
                     SlashResult::Unknown(format!("Unknown agent: {}", arg))
                 }
             }
+            "/tasks" => {
+                let status_filter = if arg.is_empty() { None } else { Some(arg.to_string()) };
+                SlashResult::Tasks { status_filter }
+            }
+            "/task" => {
+                if arg.is_empty() {
+                    SlashResult::Unknown("Usage: /task <title> [| description] [| priority]".into())
+                } else {
+                    // Parse: /task title | description | priority
+                    let parts: Vec<&str> = arg.splitn(3, '|').collect();
+                    let title = parts[0].trim().to_string();
+                    let description = parts.get(1).map(|s| s.trim().to_string()).unwrap_or_default();
+                    let priority = parts.get(2).map(|s| s.trim().to_string()).unwrap_or_else(|| "medium".into());
+                    SlashResult::TaskCreate { title, description, priority }
+                }
+            }
+            "/done" => {
+                if arg.is_empty() {
+                    SlashResult::Unknown("Usage: /done <task_id>".into())
+                } else {
+                    SlashResult::TaskUpdate { task_id: arg.to_string(), status: "done".into() }
+                }
+            }
+            "/schedules" => SlashResult::Schedules,
+            "/credits" => SlashResult::Credits,
+            "/history" => {
+                let limit = arg.parse::<u32>().unwrap_or(10);
+                SlashResult::History { limit }
+            }
+            "/memories" | "/memory" => {
+                let limit = arg.parse::<u32>().unwrap_or(20);
+                SlashResult::Memories { limit }
+            }
             "/provision" | "/sync" => SlashResult::Provision,
             "/connect" => SlashResult::Connect,
+            "/reset" => SlashResult::Reset,
             "/clear" => SlashResult::Clear,
             "/quit" | "/q" | "/exit" => SlashResult::Quit,
             _ => SlashResult::Unknown(format!("Unknown command: {}", command)),
         }
     }
 
-    pub fn push_message(&mut self, role: &str, content: &str) {
-        self.messages.push(ChatMessage {
-            role: role.into(),
-            content: content.into(),
-        });
-    }
-
-    /// Submit the current input as a query. Returns Err with message if can't send.
-    /// Uses project query (chat channel) when project_id is configured,
-    /// falls back to direct agent query otherwise.
-    pub fn submit_query(&mut self) -> Result<(), String> {
-        let message = self.input.trim().to_string();
-        if message.is_empty() { return Ok(()); }
-
-        self.input.clear();
-        self.cursor_pos = 0;
-        self.push_message("user", &message);
-
-        if self.client.is_none() {
-            let err = "Not connected. Check STARFLASK_API_KEY or use /connect.".to_string();
-            self.push_message("error", &err);
-            return Err(err);
-        };
-
-        self.querying = true;
-        self.progress_text = Some("Sending query...".to_string());
-
-        // Log to DB
-        let capability = self.current_agent.clone();
-        let _ = self.db.log_message(&capability, None, &message, "user");
-
-        let tx = self.event_tx.clone().unwrap();
-        let config = self.config.clone();
-        let project_id = self.config.project_id.clone();
-        let agent_id = self.current_agent_id.clone();
-        let msg = message.clone();
-
-        tokio::spawn(async move {
-            let client = match StarflaskClient::new(&config) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::QueryComplete(Err(e)));
-                    return;
-                }
-            };
-
-            if let Some(pid) = project_id {
-                // Project chat channel flow
-                let (session_id, _agent_id) = match client.project_query(&pid, &msg).await {
-                    Ok(ids) => ids,
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::QueryComplete(Err(e)));
-                        return;
-                    }
-                };
-
-                let tx_progress = tx.clone();
-                let result = client.poll_session_by_id(&session_id, move |evt| {
-                    let _ = tx_progress.send(AppEvent::Progress(evt));
-                }).await;
-
-                match result {
-                    Ok(session) => {
-                        let text = starflask::parse_text_result(&session.result);
-                        let _ = tx.send(AppEvent::QueryComplete(Ok(text)));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::QueryComplete(Err(e)));
-                    }
-                }
-            } else {
-                // Direct agent query fallback
-                let Some(agent_id) = agent_id else {
-                    let _ = tx.send(AppEvent::QueryComplete(Err(
-                        "No project or agent configured. Run `starkbot setup`.".into()
-                    )));
-                    return;
-                };
-
-                let session_id = match client.create_session(&agent_id, &msg).await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::QueryComplete(Err(e)));
-                        return;
-                    }
-                };
-
-                let tx_progress = tx.clone();
-                let result = client.poll_session(&agent_id, &session_id, move |evt| {
-                    let _ = tx_progress.send(AppEvent::Progress(evt));
-                }).await;
-
-                match result {
-                    Ok(session) => {
-                        let text = starflask::parse_text_result(&session.result);
-                        let _ = tx.send(AppEvent::QueryComplete(Ok(text)));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::QueryComplete(Err(e)));
-                    }
-                }
-            }
-        });
-        Ok(())
-    }
-
-    /// Spawn async provision task to sync agents from API.
-    pub fn start_provision(&mut self) -> Result<(), String> {
-        let Some(ref _client) = self.client else {
-            return Err("Not connected. Use /connect to set API key first.".to_string());
-        };
-
-        let tx = self.event_tx.clone().unwrap();
-        let config = self.config.clone();
-
-        tokio::spawn(async move {
-            let client = match StarflaskClient::new(&config) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::ProvisionComplete(Err(e)));
-                    return;
-                }
-            };
-
-            match client.list_agents().await {
-                Ok(agents) => { let _ = tx.send(AppEvent::ProvisionComplete(Ok(agents))); }
-                Err(e) => { let _ = tx.send(AppEvent::ProvisionComplete(Err(e))); }
-            }
-        });
-
-        Ok(())
-    }
-
-    /// Process provisioned agents — upsert into DB and reload.
     pub fn finish_provision(&mut self, remote_agents: &[serde_json::Value]) -> Vec<String> {
-        let mut synced = Vec::new();
-        for agent in remote_agents {
-            let id = agent.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let name = agent.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let desc = agent.get("description").and_then(|v| v.as_str()).unwrap_or("");
-            let capability = agent.get("capability")
-                .or_else(|| agent.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            if id.is_empty() || capability.is_empty() {
-                continue;
-            }
-
-            if self.db.upsert_agent(capability, id, name, desc, "active").is_ok() {
-                synced.push(format!("{} ({})", capability, name));
-            }
-        }
-        self.load_agents();
+        self.agents = db::parse_agents(remote_agents);
+        let synced: Vec<String> = self.agents.iter()
+            .map(|a| format!("{} ({})", a.capability, a.name))
+            .collect();
+        self.resolve_current_agent();
         synced
-    }
-
-    pub fn handle_progress(&mut self, event: ProgressEvent) {
-        match event {
-            ProgressEvent::StatusChange(status) => {
-                self.progress_text = Some(format!("Status: {}", status));
-            }
-            ProgressEvent::LogEntry { summary, .. } => {
-                self.progress_text = Some(summary);
-            }
-            ProgressEvent::Error(e) => {
-                self.progress_text = Some(format!("Warning: {}", e));
-            }
-        }
-    }
-
-    pub fn handle_query_complete(&mut self, result: Result<String, String>) -> String {
-        self.querying = false;
-        self.progress_text = None;
-
-        match result {
-            Ok(text) => {
-                let content = if text.is_empty() { "(empty response)".to_string() } else { text };
-                self.push_message("agent", &content);
-                let _ = self.db.log_message(&self.current_agent, None, &content, "agent");
-                content
-            }
-            Err(e) => {
-                let content = format!("Error: {}", e);
-                self.push_message("error", &content);
-                content
-            }
-        }
-    }
-
-    // ── Input editing ──
-
-    pub fn input_char(&mut self, c: char) {
-        self.input.insert(self.cursor_pos, c);
-        self.cursor_pos += c.len_utf8();
-    }
-
-    pub fn input_backspace(&mut self) {
-        if self.cursor_pos > 0 {
-            let prev = self.input[..self.cursor_pos]
-                .chars()
-                .last()
-                .map(|c| c.len_utf8())
-                .unwrap_or(0);
-            self.cursor_pos -= prev;
-            self.input.remove(self.cursor_pos);
-        }
-    }
-
-    pub fn input_delete(&mut self) {
-        if self.cursor_pos < self.input.len() {
-            self.input.remove(self.cursor_pos);
-        }
-    }
-
-    pub fn input_left(&mut self) {
-        if self.cursor_pos > 0 {
-            let prev = self.input[..self.cursor_pos]
-                .chars()
-                .last()
-                .map(|c| c.len_utf8())
-                .unwrap_or(0);
-            self.cursor_pos -= prev;
-        }
-    }
-
-    pub fn input_right(&mut self) {
-        if self.cursor_pos < self.input.len() {
-            let next = self.input[self.cursor_pos..]
-                .chars()
-                .next()
-                .map(|c| c.len_utf8())
-                .unwrap_or(0);
-            self.cursor_pos += next;
-        }
-    }
-
-    pub fn input_home(&mut self) {
-        self.cursor_pos = 0;
-    }
-
-    pub fn input_end(&mut self) {
-        self.cursor_pos = self.input.len();
     }
 }

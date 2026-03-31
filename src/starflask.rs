@@ -4,6 +4,7 @@
 //! control the polling loop and emit progress events to the TUI.
 
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 use uuid::Uuid;
@@ -259,6 +260,106 @@ impl StarflaskClient {
         }
     }
 
+    // ── Subscription & Credits ──
+
+    /// Get subscription status and credit balance.
+    pub async fn get_subscription_status(&self) -> Result<Value, String> {
+        self.get("/subscriptions/status").await
+    }
+
+    // ── Project Tasks ──
+
+    /// List tasks for a project. Optional status filter.
+    pub async fn list_project_tasks(
+        &self,
+        project_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<Value>, String> {
+        let path = match status {
+            Some(s) => format!("/projects/{}/tasks?status={}", project_id, s),
+            None => format!("/projects/{}/tasks", project_id),
+        };
+        let resp = self.get(&path).await?;
+        resp.as_array()
+            .cloned()
+            .ok_or_else(|| "Unexpected tasks response format".into())
+    }
+
+    /// Create a project task.
+    pub async fn create_project_task(
+        &self,
+        project_id: &str,
+        title: &str,
+        description: &str,
+        priority: &str,
+    ) -> Result<Value, String> {
+        let body = serde_json::json!({
+            "title": title,
+            "description": description,
+            "priority": priority,
+        });
+        self.post(&format!("/projects/{}/tasks", project_id), body).await
+    }
+
+    /// Update a project task's status.
+    pub async fn update_project_task_status(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        status: &str,
+    ) -> Result<Value, String> {
+        let body = serde_json::json!({ "status": status });
+        self.put(&format!("/projects/{}/tasks/{}", project_id, task_id), body).await
+    }
+
+    // ── Agent Tasks / Schedules ──
+
+    /// List tasks/schedules for an agent.
+    pub async fn list_agent_tasks(&self, agent_id: &str) -> Result<Vec<Value>, String> {
+        let resp = self.get(&format!("/agents/{}/tasks", agent_id)).await?;
+        resp.as_array()
+            .cloned()
+            .ok_or_else(|| "Unexpected agent tasks response format".into())
+    }
+
+    // ── Project Sessions (History) ──
+
+    /// List recent sessions for a project.
+    pub async fn list_project_sessions(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<Vec<Value>, String> {
+        let resp = self.get(&format!("/projects/{}/sessions?limit={}", project_id, limit)).await?;
+        resp.as_array()
+            .cloned()
+            .ok_or_else(|| "Unexpected sessions response format".into())
+    }
+
+    // ── Agent Memories ──
+
+    /// List memories for an agent.
+    pub async fn list_agent_memories(
+        &self,
+        agent_id: &str,
+        limit: u32,
+    ) -> Result<Vec<Value>, String> {
+        let resp = self.get(&format!("/agents/{}/memories?limit={}", agent_id, limit)).await?;
+        resp.as_array()
+            .cloned()
+            .ok_or_else(|| "Unexpected memories response format".into())
+    }
+
+    /// Get the WebSocket URL for session streaming.
+    pub fn ws_url(&self, project_id: &str) -> String {
+        let base = self.base_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
+            .trim_end_matches("/api")
+            .to_string();
+        format!("{}/ws/sessions?api_key={}&project_id={}", base, self.api_key, project_id)
+    }
+
     // ── HTTP helpers ──
 
     async fn post(&self, path: &str, body: Value) -> Result<Value, String> {
@@ -296,6 +397,121 @@ impl StarflaskClient {
         }
 
         resp.json::<Value>().await.map_err(|e| format!("GET {} parse: {}", path, e))
+    }
+
+    async fn put(&self, path: &str, body: Value) -> Result<Value, String> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self.client
+            .put(&url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("PUT {}: {}", path, e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("PUT {} returned {}: {}", path, status, body));
+        }
+
+        resp.json::<Value>().await.map_err(|e| format!("PUT {} parse: {}", path, e))
+    }
+}
+
+// ── WebSocket session streaming ──
+
+/// A session completion event received via WebSocket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEvent {
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: Option<String>,
+    pub project_id: Option<String>,
+    pub status: String,
+    pub hook_event: Option<String>,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    pub source_session_id: Option<String>,
+    pub source_agent_id: Option<String>,
+}
+
+impl SessionEvent {
+    /// Format this event as a human-readable summary string.
+    pub fn summary(&self) -> String {
+        let agent = self.agent_name.as_deref().unwrap_or("unknown");
+        let hook = self.hook_event.as_deref().unwrap_or("query");
+        let status_icon = match self.status.as_str() {
+            "completed" => "ok",
+            "failed" => "FAIL",
+            _ => &self.status,
+        };
+
+        let result_preview = if let Some(err) = &self.error {
+            let preview = truncate_str(err, 60);
+            format!(" | {}", preview)
+        } else if let Some(result) = &self.result {
+            let text = parse_text_result(&Some(result.clone()));
+            if text.is_empty() {
+                String::new()
+            } else {
+                let preview = truncate_str(&text, 60);
+                format!(" | {}", preview)
+            }
+        } else {
+            String::new()
+        };
+
+        let sid = &self.session_id[..8.min(self.session_id.len())];
+        format!("[{}] {} ({}) [{}]{}", sid, agent, hook, status_icon, result_preview)
+    }
+}
+
+/// Connect to the WebSocket session stream and call `on_event` for each event.
+/// This blocks until the connection is closed or an error occurs.
+/// Designed to run in a background task via `smol::spawn`.
+pub async fn ws_session_stream<F>(
+    ws_url: &str,
+    mut on_event: F,
+) -> Result<(), String>
+where
+    F: FnMut(SessionEvent) + Send,
+{
+    use async_tungstenite::async_std::connect_async;
+    use smol::stream::StreamExt;
+
+    let (mut ws_stream, _) = connect_async(ws_url)
+        .await
+        .map_err(|e| format!("WebSocket connect failed: {}", e))?;
+
+    while let Some(msg) = ws_stream.next().await {
+        match msg {
+            Ok(async_tungstenite::tungstenite::Message::Text(text)) => {
+                match serde_json::from_str::<SessionEvent>(&text) {
+                    Ok(event) => on_event(event),
+                    Err(e) => {
+                        eprintln!("WS parse error: {} (text: {})", e, truncate_str(&text, 100));
+                    }
+                }
+            }
+            Ok(async_tungstenite::tungstenite::Message::Close(_)) => break,
+            Err(e) => {
+                return Err(format!("WebSocket error: {}", e));
+            }
+            _ => {} // ignore ping/pong/binary
+        }
+    }
+
+    Ok(())
+}
+
+/// Truncate a string to at most `max_chars` characters (char-boundary safe).
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
     }
 }
 

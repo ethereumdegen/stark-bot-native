@@ -95,6 +95,23 @@ impl Config {
         Ok(())
     }
 
+    /// Wipe all config: .env (API key) and config.yaml.
+    pub fn reset() -> Result<(), String> {
+        let dir = config_dir();
+        let env_path = dir.join(".env");
+        let config_path = dir.join("config.yaml");
+        if env_path.exists() {
+            std::fs::remove_file(&env_path).map_err(|e| e.to_string())?;
+        }
+        if config_path.exists() {
+            std::fs::remove_file(&config_path).map_err(|e| e.to_string())?;
+        }
+        // Clear from current process
+        // SAFETY: single-threaded at this point
+        unsafe { std::env::remove_var("STARFLASK_API_KEY"); }
+        Ok(())
+    }
+
     pub fn base_url(&self) -> String {
         std::env::var("STARFLASK_BASE_URL")
             .ok()
@@ -109,8 +126,3 @@ pub fn config_dir() -> PathBuf {
         .join("starkbot")
 }
 
-pub fn db_path() -> PathBuf {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir).ok();
-    dir.join("starkbot.db")
-}

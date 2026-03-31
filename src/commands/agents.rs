@@ -1,12 +1,15 @@
-use crate::config;
-use crate::db::Database;
+use crate::config::Config;
+use crate::db;
+use crate::starflask::StarflaskClient;
 
-pub fn run() -> Result<(), String> {
-    let db = Database::open(&config::db_path())?;
-    let agents = db.list_agents()?;
+pub async fn run() -> Result<(), String> {
+    let config = Config::load();
+    let client = StarflaskClient::new(&config)?;
+    let remote_agents = client.list_agents().await?;
+    let agents = db::parse_agents(&remote_agents);
 
     if agents.is_empty() {
-        println!("No agents found. Run `starkbot provision` to sync agents.");
+        println!("No agents found. Create agents at https://starflask.com");
         return Ok(());
     }
 

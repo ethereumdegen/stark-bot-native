@@ -1,14 +1,13 @@
-use crate::config::{self, Config};
-use crate::db::Database;
+use crate::config::Config;
+use crate::db;
 use crate::starflask::StarflaskClient;
 
 pub async fn run(file: Option<String>) -> Result<(), String> {
     let config = Config::load();
-    let db = Database::open(&config::db_path())?;
 
-    // If a seed file is given, load agents from it
+    // If a seed file is given, load and display agents from it
     if let Some(path) = file {
-        return load_seed_file(&db, &path);
+        return show_seed_file(&path);
     }
 
     // Otherwise, sync from Starflask API
@@ -16,51 +15,26 @@ pub async fn run(file: Option<String>) -> Result<(), String> {
     println!("Syncing agents from Starflask...");
 
     let remote_agents = client.list_agents().await?;
-    let mut count = 0;
+    let agents = db::parse_agents(&remote_agents);
 
-    for agent in &remote_agents {
-        let id = agent.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let name = agent.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let desc = agent.get("description").and_then(|v| v.as_str()).unwrap_or("");
-        let capability = agent.get("capability")
-            .or_else(|| agent.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if id.is_empty() || capability.is_empty() {
-            continue;
-        }
-
-        db.upsert_agent(capability, id, name, desc, "active")?;
-        println!("  {} ({}) -> {}", capability, name, id);
-        count += 1;
+    for agent in &agents {
+        println!("  {} ({}) -> {}", agent.capability, agent.name, agent.agent_id);
     }
 
-    println!("Synced {} agents.", count);
+    println!("Synced {} agents.", agents.len());
     Ok(())
 }
 
-fn load_seed_file(db: &Database, path: &str) -> Result<(), String> {
+fn show_seed_file(path: &str) -> Result<(), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path, e))?;
-    let agents: Vec<serde_json::Value> = serde_json::from_str(&content)
+    let raw: Vec<serde_json::Value> = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse {}: {}", path, e))?;
 
-    let mut count = 0;
+    let agents = db::parse_agents(&raw);
     for agent in &agents {
-        let id = agent.get("agent_id").or_else(|| agent.get("id"))
-            .and_then(|v| v.as_str()).unwrap_or("");
-        let capability = agent.get("capability").and_then(|v| v.as_str()).unwrap_or("");
-        let name = agent.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let desc = agent.get("description").and_then(|v| v.as_str()).unwrap_or("");
-
-        if id.is_empty() || capability.is_empty() { continue; }
-
-        db.upsert_agent(capability, id, name, desc, "active")?;
-        println!("  {} ({}) -> {}", capability, name, id);
-        count += 1;
+        println!("  {} ({}) -> {}", agent.capability, agent.name, agent.agent_id);
     }
-
-    println!("Loaded {} agents from seed file.", count);
+    println!("Found {} agents in seed file.", agents.len());
     Ok(())
 }

@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "starkbot", version, about = "Terminal AI agent client for Starflask")]
+#[command(name = "stark-bot", version, about = "Terminal AI agent client for Starflask")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,

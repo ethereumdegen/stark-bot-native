@@ -1,15 +1,19 @@
-use crate::config::{self, Config};
-use crate::db::Database;
+use crate::config::Config;
+use crate::db;
 use crate::starflask::{self, StarflaskClient};
 
 pub async fn run(agent: &str, message: &str) -> Result<(), String> {
     let config = Config::load();
-    let db = Database::open(&config::db_path())?;
     let client = StarflaskClient::new(&config)?;
 
-    // Resolve agent ID
-    let agent_record = db.get_agent(agent)?
-        .ok_or_else(|| format!("Agent '{}' not found. Run `starkbot provision` first.", agent))?;
+    // Fetch agents from API and find the requested one
+    let remote_agents = client.list_agents().await?;
+    let agents = db::parse_agents(&remote_agents);
+    let agent_lower = agent.to_lowercase();
+    let agent_record = agents.iter()
+        .find(|a| a.capability.to_lowercase() == agent_lower || a.name.to_lowercase() == agent_lower)
+        .ok_or_else(|| format!("Agent '{}' not found. Available: {}", agent,
+            agents.iter().map(|a| a.capability.as_str()).collect::<Vec<_>>().join(", ")))?;
 
     eprintln!("Querying {} ({})...", agent_record.name, agent_record.capability);
 

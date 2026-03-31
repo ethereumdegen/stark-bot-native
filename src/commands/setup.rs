@@ -1,12 +1,18 @@
 use std::io::{self, BufRead, Write};
 
-use crate::config::{self, Config};
-use crate::db::Database;
+use crate::config::Config;
+use crate::db;
 use crate::starflask::StarflaskClient;
-use crate::theme::*;
+
+const CYAN: &str = "\x1b[36m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const GRAY: &str = "\x1b[90m";
+const BOLD: &str = "\x1b[1m";
+const RESET: &str = "\x1b[0m";
 
 pub async fn run() -> Result<(), String> {
-    println!("\n{BOLD}{CYAN}starkbot setup{RESET}\n");
+    println!("\n{BOLD}{CYAN}stark-bot setup{RESET}\n");
 
     // ── Step 1: API Key ──
     println!("{BOLD}[1/3] API Key{RESET}");
@@ -30,48 +36,45 @@ pub async fn run() -> Result<(), String> {
     let cfg = Config::load();
     if cfg.api_key().is_none() {
         println!("\n{YELLOW}No API key set — skipping remaining steps.{RESET}");
-        println!("{GRAY}Run `starkbot setup` again when you have a key.{RESET}");
+        println!("{GRAY}Run `stark-bot setup` again when you have a key.{RESET}");
         return Ok(());
     }
 
     // ── Step 2: Provision ──
     println!("\n{BOLD}[2/3] Provision agents{RESET}");
-    println!("  Syncing agents from Starflask...");
+    println!("  This will fetch your agents from the Starflask API");
+    println!("  so they're available in the TUI on startup.");
+    print!("  Sync agents now? [Y/n] ");
+    io::stdout().flush().map_err(|e| e.to_string())?;
+    let answer = read_line()?;
 
-    let client = StarflaskClient::new(&cfg)?;
-    let db = Database::open(&config::db_path())?;
-    let remote_agents = client.list_agents().await?;
     let mut count = 0;
+    if !answer.trim().eq_ignore_ascii_case("n") {
+        println!("  Syncing agents from Starflask...");
 
-    for agent in &remote_agents {
-        let id = agent.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let name = agent.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let desc = agent.get("description").and_then(|v| v.as_str()).unwrap_or("");
-        let capability = agent
-            .get("capability")
-            .or_else(|| agent.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let client = StarflaskClient::new(&cfg)?;
+        let remote_agents = client.list_agents().await?;
+        let agents = db::parse_agents(&remote_agents);
 
-        if id.is_empty() || capability.is_empty() {
-            continue;
+        for agent in &agents {
+            println!("  {GREEN}+{RESET} {} {GRAY}({}){RESET}", agent.capability, agent.name);
+            count += 1;
         }
 
-        db.upsert_agent(capability, id, name, desc, "active")?;
-        println!("  {GREEN}+{RESET} {capability} {GRAY}({name}){RESET}");
-        count += 1;
+        if count == 0 {
+            println!("  {YELLOW}No agents found on Starflask.{RESET}");
+        } else {
+            println!("  Synced {count} agent(s).");
+        }
+    } else {
+        println!("  {GRAY}Skipped. Agents will be fetched when the TUI starts.{RESET}");
     }
-
-    if count == 0 {
-        println!("  {YELLOW}No agents found on Starflask.{RESET}");
-        return Ok(());
-    }
-    println!("  Synced {count} agent(s).");
 
     // ── Step 3: Select project ──
     println!("\n{BOLD}[3/3] Select project{RESET}");
     println!("  Fetching projects...");
 
+    let client = StarflaskClient::new(&cfg)?;
     let projects = client.list_projects().await;
     let mut cfg = cfg;
 
@@ -123,7 +126,7 @@ pub async fn run() -> Result<(), String> {
         }
     }
 
-    println!("\n{GREEN}{BOLD}Setup complete!{RESET} Run {CYAN}starkbot{RESET} to start chatting.\n");
+    println!("\n{GREEN}{BOLD}Setup complete!{RESET} Run {CYAN}stark-bot{RESET} to start chatting.\n");
     Ok(())
 }
 
